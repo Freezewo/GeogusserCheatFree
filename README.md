@@ -23,7 +23,7 @@ pip install -r requirements.txt
 1. **Steam** → ПКМ по **GeoGuessr** → **Свойства**
 2. В **Параметры запуска** добавьте:
    ```
-   --remote-debugging-port=9222
+   --remote-debugging-port=9222 --remote-allow-origins=*
    ```
 3. Запустите GeoGuessr
 
@@ -46,3 +46,4 @@ python geoguessr_tool.py
 |------|----------|
 | `geoguessr_tool.py` | Основной скрипт |
 | `requirements.txt` | Python-зависимости |
+
