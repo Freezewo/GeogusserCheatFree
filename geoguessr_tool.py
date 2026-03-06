@@ -4,14 +4,16 @@ import threading
 import sys
 import io
 import math
+import ctypes
 import tkinter as tk
 
 try:
     import websocket
     import requests
     from PIL import Image, ImageTk, ImageDraw
+    from pynput import keyboard
 except ImportError:
-    print("pip install websocket-client requests Pillow")
+    print("pip install websocket-client requests Pillow pynput")
     sys.exit(1)
 
 CDP_HOST = "127.0.0.1"
@@ -244,6 +246,10 @@ class Overlay:
         self._zoom = 7
         self._lat = None
         self._lng = None
+        self._tile_cache = {}
+        self._last_crop = None
+        self._user32 = None
+        self._affinity_hwnds = set()
 
     def build(self):
         self.root = tk.Tk()
@@ -254,6 +260,7 @@ class Overlay:
         self.root.configure(bg=self.BG)
         self.root.geometry("310x390+20+20")
         self._drag = {"x": 0, "y": 0}
+        self._visible = True
 
         hdr = tk.Frame(self.root, bg=self.BG2, height=34)
         hdr.pack(fill="x")
@@ -311,20 +318,114 @@ class Overlay:
         tk.Label(ft, text="drag to move", bg=self.BG2, fg="#333", font=("Consolas", 7)).pack(pady=2)
 
         self.running = True
+        self.root.update()
+        self._setup_capture_protection()
+
+    def _setup_capture_protection(self):
+        try:
+            from ctypes import WinDLL, c_bool, c_uint, WINFUNCTYPE, c_int
+            from ctypes.wintypes import HWND, LPCWSTR, BOOL, LPARAM
+
+            self._user32 = WinDLL('user32', use_last_error=True)
+            self._user32.SetWindowDisplayAffinity.argtypes = [HWND, c_uint]
+            self._user32.SetWindowDisplayAffinity.restype = c_bool
+            self._user32.FindWindowW.argtypes = [LPCWSTR, LPCWSTR]
+            self._user32.FindWindowW.restype = HWND
+            self._user32.GetWindow.argtypes = [HWND, c_uint]
+            self._user32.GetWindow.restype = HWND
+
+            ENUMPROC = WINFUNCTYPE(BOOL, HWND, LPARAM)
+            self._user32.EnumChildWindows.argtypes = [HWND, ENUMPROC, LPARAM]
+
+            def enum_cb(child_hwnd, _):
+                self._affinity_hwnds.add(child_hwnd)
+                return True
+            self._enum_cb = ENUMPROC(enum_cb)
+        except: pass
+        self._apply_all_affinity()
+        self._reapply_loop()
+
+    def _apply_all_affinity(self):
+        if not self._user32: return
+        try:
+            hwnds = set()
+            try: hwnds.add(int(self.root.frame(), 16))
+            except: pass
+            hwnds.add(self.root.winfo_id())
+            h = self._user32.FindWindowW(None, "GeoGuessr Tool")
+            if h: hwnds.add(h)
+            try:
+                self._affinity_hwnds.clear()
+                for hw in list(hwnds):
+                    self._user32.EnumChildWindows(hw, self._enum_cb, 0)
+            except: pass
+            hwnds.update(self._affinity_hwnds)
+            for hw in hwnds:
+                if hw:
+                    from ctypes.wintypes import HWND as H
+                    self._user32.SetWindowDisplayAffinity(H(hw), 0x00000011)
+        except: pass
+
+    def _reapply_loop(self):
+        if not self.running: return
+        self._apply_all_affinity()
+        self.root.after(1000, self._reapply_loop)
 
     def _sd(self, e): self._drag["x"], self._drag["y"] = e.x, e.y
     def _od(self, e):
         self.root.geometry(f"+{self.root.winfo_x()+e.x-self._drag['x']}+{self.root.winfo_y()+e.y-self._drag['y']}")
 
+    def _toggle(self):
+        if self._visible:
+            self.root.withdraw()
+            self._visible = False
+        else:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self._visible = True
+
+    def _hotkey_listener(self):
+        def on_press(key):
+            if key == keyboard.Key.f2:
+                if self.root:
+                    self.root.after(0, self._toggle)
+        keyboard.Listener(on_press=on_press, daemon=True).start()
+
+    def _quick_zoom(self, factor):
+        if self._last_crop:
+            w, h = self._last_crop.size
+            nw, nh = int(w * factor), int(h * factor)
+            scaled = self._last_crop.resize((nw, nh), Image.NEAREST)
+            cx, cy = nw // 2, nh // 2
+            hw, hh = self.MAP_W // 2, self.MAP_H // 2
+            preview = scaled.crop((cx - hw, cy - hh, cx + hw, cy + hh))
+            self._set_map(preview)
+
     def _zin(self):
         if self._zoom < 17:
             self._zoom += 1
+            self._quick_zoom(2.0)
             if self._lat: self._load_map(self._lat, self._lng)
 
     def _zout(self):
         if self._zoom > 2:
             self._zoom -= 1
+            self._quick_zoom(0.5)
             if self._lat: self._load_map(self._lat, self._lng)
+
+    def _get_tile(self, z, tx, ty):
+        key = (z, tx, ty)
+        if key in self._tile_cache:
+            return self._tile_cache[key]
+        try:
+            r = requests.get(f"https://tile.openstreetmap.org/{z}/{tx}/{ty}.png",
+                             timeout=4, headers={"User-Agent": "GeoTool/1.0"})
+            if r.status_code == 200:
+                tile = Image.open(io.BytesIO(r.content))
+                self._tile_cache[key] = tile
+                return tile
+        except: pass
+        return None
 
     def _load_map(self, lat, lng):
         self._lat, self._lng = lat, lng
@@ -338,17 +439,14 @@ class Overlay:
                 px, py = int((xe-tx)*256), int((ye-ty)*256)
 
                 canvas = Image.new("RGB", (768, 768), "#ddd")
-                h = {"User-Agent": "GeoTool/1.0"}
                 for dy in range(-1, 2):
                     for dx in range(-1, 2):
                         ttx = (tx+dx) % n
                         tty = ty+dy
                         if tty < 0 or tty >= n: continue
-                        try:
-                            r = requests.get(f"https://tile.openstreetmap.org/{z}/{ttx}/{tty}.png", timeout=4, headers=h)
-                            if r.status_code == 200:
-                                canvas.paste(Image.open(io.BytesIO(r.content)), ((dx+1)*256, (dy+1)*256))
-                        except: pass
+                        tile = self._get_tile(z, ttx, tty)
+                        if tile:
+                            canvas.paste(tile, ((dx+1)*256, (dy+1)*256))
 
                 cx, cy = 256+px, 256+py
                 hw, hh = self.MAP_W//2, self.MAP_H//2
@@ -366,6 +464,7 @@ class Overlay:
 
     def _set_map(self, img):
         try:
+            self._last_crop = img.copy()
             self._photo = ImageTk.PhotoImage(img)
             self.lb_map.config(image=self._photo, text="", width=self.MAP_W, height=self.MAP_H)
         except: pass
@@ -409,6 +508,7 @@ class Overlay:
 
     def run(self):
         self.build()
+        self._hotkey_listener()
         self._loop()
         self.root.mainloop()
 
